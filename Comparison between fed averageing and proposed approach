@@ -1,0 +1,13 @@
+##Comparison between fed averageing and proposed approach
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision.datasets import MNIST
+from torchvision import transforms
+import copy
+import concurrent.futures
+import matplotlib.pyplot as plt
+
