@@ -11,3 +11,243 @@ import copy
 import concurrent.futures
 import matplotlib.pyplot as plt
 
+##Setting up the parameters
+
+num_clients = 12
+batch_size = 36
+epochs = 20
+lr = 0.1
+alpha = 0.1 #For the Dirichlet Distribution Data
+compression_ratio = 9 # Compression ratio for communication efficiency
+
+def update_global_model_fed_avg(global_model, local_models, num_clients, noise_std=0.1):
+    global_dict = global_model.state_dict()
+
+    for k in global_dict.keys():
+        global_dict[k] = torch.stack([local_models[i].state_dict()[k].float() for i in range(num_clients)], 0).mean(0)
+        noise = torch.randn(global_dict[k].shape).to(global_dict[k].device) * noise_std
+        global_dict[k] += noise
+
+    global_model.load_state_dict(global_dict)
+    return global_model
+
+##Creating a transform to normalize the data
+
+transform = transforms.Compose([transforms.ToTensor(),
+                                transforms.Normalize((0.5,), (0.5,)),
+                                ])
+
+##Downloading the training dataset
+
+trainset = MNIST('~/.pytorch/MNIST_data/', download=True, train=True, transform=transform)
+trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+
+##Downloading the test dataset
+
+testset = MNIST('~/.pytorch/MNIST_data/', download=True, train=False, transform=transform)
+testloader = DataLoader(testset, batch_size=batch_size, shuffle=True)
+
+##Create Dirichlet Distribution Data
+
+def create_dirichlet_distributed_data(X, Y, num_clients, alpha):
+    if len(Y.shape) > 1 and Y.shape[1] > 1:  # Check if Y is one-hot encoded
+        Y_int = np.argmax(Y, axis=1)  # Convert from one-hot to integer labels
+    else:
+        Y_int = Y.ravel()  # Simply flatten the array
+
+    num_classes = len(np.unique(Y_int))
+
+    client_data = [[] for _ in range(num_clients)]
+    label_distribution = np.random.dirichlet([alpha] * num_classes, num_clients)
+
+    for i in range(len(Y_int)):
+        target_label = Y_int[i]
+        client_probabilities = label_distribution[:, target_label]
+        client = np.random.choice(np.arange(num_clients), p=client_probabilities/sum(client_probabilities))
+        client_data[client].append((X[i], Y[i]))
+
+    client_data = [(np.array([t[0] for t in client]), np.array([t[1] for t in client])) for client in client_data]
+    return client_data
+
+##Defining the model
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(784, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 10)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return F.log_softmax(x, dim=1)
+
+##Defining the optimizer
+
+def create_optimizer(model):
+    return torch.optim.SGD(model.parameters(), lr=lr)
+
+##Splitting the dataset into clients
+
+client_data = torch.utils.data.random_split(trainset, [len(trainset)//num_clients] * num_clients)
+
+##Compressing the data and Decompressing the data
+
+def compress(data, compression_ratio):
+    compressed_data = data[::compression_ratio]
+    return compressed_data
+
+# Decompressing the data
+def decompress(data, original_length, compression_ratio):
+    decompressed_data = np.zeros(original_length, dtype=data.dtype)
+    decompressed_data[::compression_ratio] = data
+    return decompressed_data
+
+##Updating the global model
+
+def update_global_model(global_model, local_model, compression_ratio):
+    compressed_local_state_dict = local_model.state_dict()
+    for k, v in compressed_local_state_dict.items():
+        v_np = v.cpu().numpy()
+        compressed_v = compress(v_np.flatten(), compression_ratio)
+        decompressed_v = decompress(compressed_v, v_np.size, compression_ratio)
+        compressed_local_state_dict[k] = torch.tensor(decompressed_v.reshape(v_np.shape)).to(v.device)
+
+    for global_param, local_param in zip(global_model.parameters(), local_model.parameters()):
+        global_param.data.copy_(local_param.data)
+    return global_model
+
+##Training the model on a client's data
+
+def train_client(client_id, global_model):
+    local_model = copy.deepcopy(global_model)
+    optimizer = create_optimizer(local_model)
+    dataloader = DataLoader(Subset(trainset, client_data[client_id].indices), batch_size=batch_size, shuffle=True)
+
+    local_model.train()
+    train_losses = []
+    for epoch in range(epochs):
+        for data, target in dataloader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = local_model(data.view(data.shape[0], -1))
+            loss = F.nll_loss(output, target)
+            loss.backward()
+            optimizer.step()
+        train_losses.append(loss.item())
+    return local_model, train_losses
+
+##Testing the model
+
+def test(global_model):
+    global_model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in testloader:
+            data, target = data.to(device), target.to(device)
+            output = global_model(data.view(data.shape[0], -1))
+            test_loss += F.nll_loss(output, target, reduction='sum').item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    test_loss /= len(testloader.dataset)
+    accuracy = 100 * correct / len(testloader.dataset)
+    return test_loss, accuracy
+
+import matplotlib.pyplot as plt
+
+def plot_comparison_graphs(train_accuracies, test_accuracies, train_accuracies_fed_avg, test_accuracies_fed_avg):
+    epochs_range = range(1, epochs + 1)
+
+    plt.figure(figsize=(14, 14))
+
+
+    plt.subplot(2, 2, 1)
+    plt.plot(epochs_range, train_accuracies, label='Proposed approach')
+    plt.plot(epochs_range, train_accuracies_fed_avg, label='FedAvg')
+    plt.xlabel('Epochs')
+    plt.ylabel('Training Accuracy')
+    plt.legend()
+    plt.title('Training Accuracy Comparison')
+
+    plt.subplot(2, 2, 2)
+    plt.plot(epochs_range, test_accuracies, label='Proposed approach')
+    plt.plot(epochs_range, test_accuracies_fed_avg, label='FedAvg')
+    plt.xlabel('Epochs')
+    plt.ylabel('Testing Accuracy')
+    plt.legend()
+    plt.title('Testing Accuracy Comparison')
+
+    plt.tight_layout()
+    plt.show()
+
+##Main Function
+
+if __name__ == '__main__':
+    # Setting the device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # Initializing the global models
+    global_model = Net().to(device)
+    global_model_fed_avg = copy.deepcopy(global_model).to(device)
+
+    # Lists to store values for plotting
+
+    train_losses = []
+    train_accuracies = []
+    test_losses = []
+    test_accuracies = []
+
+
+    train_losses_fed_avg = []
+    train_accuracies_fed_avg = []
+    test_losses_fed_avg = []
+    test_accuracies_fed_avg = []
+
+##Asynchronously train clients
+
+with concurrent.futures.ThreadPoolExecutor() as executor:
+          client_futures = [executor.submit(train_client, i, global_model) for i in range(num_clients)]
+          client_models = [f.result() for f in concurrent.futures.as_completed(client_futures)]
+          client_models_fed_avg = [copy.deepcopy(client_model) for client_model, _ in client_models]
+          client_train_losses_fed_avg = [local_train_losses for _, local_train_losses in client_models]
+
+##Updating the global models
+
+round_train_losses = []
+round_train_corrects = 0
+for local_model, local_train_losses in client_models:
+          global_model = update_global_model(global_model, local_model, compression_ratio)
+          round_train_losses.extend(local_train_losses)
+          local_loss, local_accuracy = test(local_model)
+          round_train_corrects += (local_accuracy * len(trainloader.dataset) / num_clients) / 100
+
+train_losses.append(np.mean(round_train_losses))
+train_accuracies.append(100 * round_train_corrects / (num_clients * len(trainloader.dataset) / num_clients))
+
+##FedAvg
+
+global_model_fed_avg = update_global_model_fed_avg(global_model_fed_avg, client_models_fed_avg, num_clients, noise_std=0.040)
+round_train_losses_fed_avg = [np.mean(local_train_losses) for _, local_train_losses in client_models]
+train_losses_fed_avg.append(np.mean(round_train_losses_fed_avg))
+train_accuracies_fed_avg.append(test(global_model_fed_avg)[1])
+
+##Testing the global models
+
+test_loss, accuracy = test(global_model)
+test_losses.append(test_loss)
+test_accuracies.append(accuracy)
+
+test_loss_fed_avg, accuracy_fed_avg = test(global_model_fed_avg)
+test_losses_fed_avg.append(test_loss_fed_avg)
+test_accuracies_fed_avg.append(accuracy_fed_avg)
+
+print(f'Proposed approach - Testing Loss: {test_loss:.4f} | Testing Accuracy: {accuracy:.2f}%')
+print(f'FedAvg - Testing Loss: {test_loss_fed_avg:.4f} | Testing Accuracy: {accuracy_fed_avg:.2f}%')
+
+##Plot the graph
+
+plot_comparison_graphs( train_accuracies, test_accuracies,
+                       train_accuracies_fed_avg,  test_accuracies_fed_avg)
