@@ -9,5 +9,5 @@ Contact: alahmadiassim@gmail.com
 
 Last updated: 1/3/2024
 
-* *All rights are reserved* *
+* *All rights are reserved*
 2024
